@@ -19,6 +19,16 @@ private class LayoutState(var parent: ViewGroup?, var l: Int, var t: Int) {
 
 private val tmpLoc = IntArray(2)
 
+/**
+ * Makes a view that is about to join a container move in from a window position instead of
+ * appearing in its slot, e.g. a new folder taking over from the icon it was made from.
+ */
+fun seedFlyFrom(v: View, fromX: Float, fromY: Float) {
+    val st = (v.getTag(R.id.layout_state) as? LayoutState)
+        ?: LayoutState(null, 0, 0).also { v.setTag(R.id.layout_state, it) }
+    st.fromX = fromX; st.fromY = fromY
+}
+
 /** Reflow feel: soft enough to read as motion, with a hint of overshoot like iOS. */
 private const val REFLOW_STIFFNESS = 165f
 private const val REFLOW_DAMPING = 0.86f
@@ -51,7 +61,8 @@ abstract class ItemContainer(protected val L: MainActivity, val role: Role) : Vi
                 if (st != null && v.isAttachedToWindow && v.visibility == View.VISIBLE && v.alpha > 0.5f) {
                     v.getLocationInWindow(tmpLoc)
                     st.fromX = tmpLoc[0].toFloat(); st.fromY = tmpLoc[1].toFloat()
-                } else st?.let { it.fromX = Float.NaN }
+                } else if (v.isAttachedToWindow) st?.let { it.fromX = Float.NaN }
+                // A detached view keeps a start point given by seedFlyFrom.
                 (v.parent as? ViewGroup)?.removeView(v)
                 st?.parent = null
                 v.spring(DynamicAnimation.TRANSLATION_X).cancel()

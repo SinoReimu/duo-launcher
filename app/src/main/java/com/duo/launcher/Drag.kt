@@ -497,12 +497,15 @@ class DragController(private val L: MainActivity) {
         phZone = null
         L.model.dissolveSmallFolders()
         L.save()
-        animateLanding(landing)
+        // Into a folder: the folder stays visible and takes the icon in; otherwise the dropped
+        // item's own view is revealed when the icon lands on it.
+        animateLanding(landing, keepTargetVisible = candidate != null && armed && allApps)
     }
 
     private fun dropIntoFolder(target: IconView): View {
         val keys = items.filterIsInstance<AppItem>().map { it.key }
         val list = L.model.containerOf(target.item)
+        val slotBefore = list?.indexOfFirst { it === target.item } ?: -1
         phZone?.let { zoneList(it)?.removeAll { i -> i === placeholder } }
         when (val t = target.item) {
             is FolderItem -> t.apps.addAll(keys)
@@ -510,6 +513,16 @@ class DragController(private val L: MainActivity) {
                 val f = FolderItem(Ids.new(), L.suggestFolderName(listOf(t.key) + keys), (listOf(t.key) + keys).toMutableList())
                 val i = list.indexOfFirst { it === t }
                 if (i >= 0) list[i] = f
+                // The new folder takes over from the icon where it is drawn now, so a reflow
+                // moves it on from there instead of it popping up in the new slot.
+                (target.parent as? View)?.takeIf { target.isAttachedToWindow }?.let { p ->
+                    p.getLocationInWindow(loc)
+                    seedFlyFrom(
+                        L.viewFor(f, target.role),
+                        loc[0] + target.left + target.translationX,
+                        loc[1] + target.top + target.translationY,
+                    )
+                }
                 L.forgetView(t)
             }
             else -> {}
@@ -519,20 +532,30 @@ class DragController(private val L: MainActivity) {
         L.rebindAll()
         val newTarget = list?.firstOrNull { it is FolderItem && keys.all { k -> k in it.apps } }
         val v = newTarget?.let { L.viewFor(it, target.role) } ?: target
-        // Pop the folder as the icon lands in it.
-        v.scaleX = 1.14f; v.scaleY = 1.14f
-        v.postDelayed({ v.springScale(1f, 420f, 0.55f) }, 120)
-        target.scaleX = 1f; target.scaleY = 1f
+        // Did the folder change slot? Taking the dragged icon out of the grid shifts everything
+        // after it, e.g. a folder at the start of a row wraps to the end of the row above.
+        val folderItem = newTarget ?: target.item
+        val listAfter = L.model.containerOf(folderItem)
+        val moved = listAfter !== list || listAfter?.indexOfFirst { it === folderItem } != slotBefore
+        if (moved) {
+            // It is flying to its new slot: just ease back to normal size, no bounce mid-flight.
+            v.springFrom(DynamicAnimation.SCALE_X, v.scaleX, 1f, 700f, 1f)
+            v.springFrom(DynamicAnimation.SCALE_Y, v.scaleY, 1f, 700f, 1f)
+        } else {
+            // Staying put: pop as the icon lands in it.
+            v.springFrom(DynamicAnimation.SCALE_X, 1.14f, 1f, 420f, 0.55f)
+            v.springFrom(DynamicAnimation.SCALE_Y, 1.14f, 1f, 420f, 0.55f)
+        }
         return v
     }
 
     /** Springs the drag image into the landing view's icon, then reveals the real view. */
-    private fun animateLanding(target: View?) {
+    private fun animateLanding(target: View?, keepTargetVisible: Boolean = false) {
         val img = image ?: return
         image = null
-        target?.let { hidden += it; it.visibility = View.INVISIBLE }
+        if (!keepTargetVisible) target?.let { hidden += it; it.visibility = View.INVISIBLE }
         val land = Runnable {
-            target?.let { hidden -= it; it.visibility = View.VISIBLE }
+            if (!keepTargetVisible) target?.let { hidden -= it; it.visibility = View.VISIBLE }
             L.root.removeView(img)
             dropping = null
         }
@@ -541,14 +564,20 @@ class DragController(private val L: MainActivity) {
             override fun onPreDraw(): Boolean {
                 L.root.viewTreeObserver.removeOnPreDrawListener(this)
                 if (target == null || !target.isAttachedToWindow) { land.run(); return true }
+                // Aim at where the target comes to rest: its layout slot, ignoring its own
+                // translation/scale (a reflow spring still moving it, the folder's landing pop).
+                // getLocationInWindow on the target itself would include those, so start from
+                // the parent and add the layout position.
                 val dst = RectF()
-                target.getLocationInWindow(loc)
+                val parent = target.parent as? View
+                if (parent != null) {
+                    parent.getLocationInWindow(loc)
+                    loc[0] += target.left; loc[1] += target.top
+                } else target.getLocationInWindow(loc)
                 if (target is IconView) {
                     target.iconRect(tmp)
                     dst.set(loc[0] + tmp.left, loc[1] + tmp.top, loc[0] + tmp.right, loc[1] + tmp.bottom)
                 } else dst.set(loc[0].toFloat(), loc[1].toFloat(), (loc[0] + target.width).toFloat(), (loc[1] + target.height).toFloat())
-                // Account for a reflow spring still moving the target.
-                dst.offset(target.translationX, target.translationY)
                 val folderDrop = target is IconView && target.item is FolderItem && items.firstOrNull() !is FolderItem &&
                     (target.item as FolderItem).apps.contains((items.firstOrNull() as? AppItem)?.key)
                 val endScale = if (folderDrop) 0.3f else dst.width() / img.width
