@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="lock_service_label">Duo Launcher double-tap to lock</string>
+    <string name="lock_service_desc">Lets Duo Launcher lock the screen when you double-tap an empty area of the Home Screen. It does not read screen content.</string>
+</resources>
