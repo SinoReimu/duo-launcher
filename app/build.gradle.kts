@@ -10,8 +10,10 @@ android {
         applicationId = "com.duo.launcher"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
+        // -PidSuffix=.dev builds a copy that installs next to the real launcher (other key, own data).
+        (findProperty("idSuffix") as String?)?.let { applicationIdSuffix = it }
     }
     buildTypes {
         release {

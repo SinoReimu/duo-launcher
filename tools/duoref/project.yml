@@ -1,0 +1,36 @@
+name: DuoRef
+options:
+  bundleIdPrefix: dev.duoref
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Host:
+    type: application
+    platform: iOS
+    sources: [Host]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.duoref.host
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+  Driver:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [Driver]
+    dependencies:
+      - target: Host
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.duoref.driver
+        SWIFT_OBJC_BRIDGING_HEADER: Driver/Bridge.h
+        SWIFT_VERSION: "5.0"
+schemes:
+  Driver:
+    build:
+      targets:
+        Host: all
+        Driver: [test]
+    test:
+      targets: [Driver]

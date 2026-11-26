@@ -50,13 +50,18 @@ class IconView(private val L: MainActivity, var item: HomeItem, var role: Role) 
     private val labelPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         textAlign = Paint.Align.CENTER
-        setShadowLayer(4f, 0f, 1f, 0x66000000)
+        // Medium weight like the iOS Home Screen labels; a soft shadow keeps them readable on
+        // bright wallpapers.
+        typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+        setShadowLayer(5f, 0f, 1f, 0x59000000)
     }
     private val folderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x5EFFFFFF }
     private val placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x33FFFFFF }
-    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xE6595959.toInt() }
+    // Remove badge: a light glass bead with a dark minus, sitting on the icon's corner.
+    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xEBE4E4E8.toInt() }
+    private val badgeRim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = 0x66FFFFFF }
     private val badgeLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE; strokeCap = Paint.Cap.ROUND
+        color = 0xFF3C3C43.toInt(); strokeCap = Paint.Cap.ROUND
     }
     private var maskPath: Path? = null
     private val tmpRect = RectF()
@@ -158,22 +163,24 @@ class IconView(private val L: MainActivity, var item: HomeItem, var role: Role) 
     private val tmpRect2 = RectF()
 
     private fun badgeCenterAndRadius(r: RectF): Triple<Float, Float, Float> {
-        val br = iconSize * 0.15f
-        return Triple(r.left + br * 0.45f, r.top + br * 0.45f, br)
+        val br = iconSize * 0.185f
+        return Triple(r.left + br * 0.3f, r.top + br * 0.3f, br)
     }
 
     private fun drawMinus(c: Canvas, r: RectF) {
         if (item !is AppItem && item !is FolderItem) return
         val (cx, cy, br) = badgeCenterAndRadius(r)
         c.drawCircle(cx, cy, br, badgePaint)
-        badgeLine.strokeWidth = br * 0.22f
-        c.drawLine(cx - br * 0.45f, cy, cx + br * 0.45f, cy, badgeLine)
+        badgeRim.strokeWidth = br * 0.09f
+        c.drawCircle(cx, cy, br - badgeRim.strokeWidth / 2f, badgeRim)
+        badgeLine.strokeWidth = br * 0.2f
+        c.drawLine(cx - br * 0.42f, cy, cx + br * 0.42f, cy, badgeLine)
     }
 
     private fun hitsBadge(x: Float, y: Float): Boolean {
         if (!L.editMode || role == Role.FINDER) return false
         val (cx, cy, br) = badgeCenterAndRadius(iconRect(tmpRect))
-        return hypot(x - cx, y - cy) < br * 1.8f
+        return hypot(x - cx, y - cy) < br * 1.6f
     }
 
     fun setHighlighted(on: Boolean) {
@@ -228,6 +235,8 @@ class IconView(private val L: MainActivity, var item: HomeItem, var role: Role) 
                 longPressed = false
                 menuOpened = false
                 tracking = true
+                // The long-press menu's shortcuts, fetched while the press is still being held.
+                appInfo?.let { L.repo.prefetchShortcuts(it) }
                 onBadge = hitsBadge(e.x, e.y)
                 if (!onBadge) setPressedAnimated(true)
                 val delay = if (L.editMode) 170L else ViewConfiguration.getLongPressTimeout().toLong().coerceAtMost(420L)

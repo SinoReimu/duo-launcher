@@ -11,6 +11,12 @@ enum class Mode { COVER, INNER_PORTRAIT, INNER_LANDSCAPE }
 /**
  * All geometry for one window size. Pages are always COLS x ROWS; what changes per mode is
  * how many pages are visible (2 in inner landscape), where the dock sits, and cell sizes.
+ *
+ * The proportions follow the iPhone Duo Home Screen as measured in the simulator
+ * (tools/duoref): 60pt icons with 12pt labels, a hugging glass dock capsule, and in the two
+ * rail modes one spacing rule, "left margin = gutter between pages = gap before the dock".
+ * They are not copied point for point: the Fold 8 screens have other aspect ratios, so every
+ * mode solves its own column pitch from those ratios and spreads the height over the six rows.
  */
 class DeviceProfile(
     val width: Int,
@@ -31,6 +37,23 @@ class DeviceProfile(
     fun dp(v: Float) = v * density
     fun dpi(v: Float) = (v * density).roundToInt()
 
+    /**
+     * Pixels per reference point. The reference screens are 951x669 (open, landscape), 669x951
+     * (open, portrait) and 466x678 (closed); the layout is scaled so both sides fit, within limits
+     * so a changed display size cannot make icons tiny or huge.
+     */
+    val unit: Float = run {
+        val (rw, rh) = when (mode) {
+            Mode.INNER_LANDSCAPE -> 951f to 669f
+            Mode.INNER_PORTRAIT -> 669f to 951f
+            Mode.COVER -> 466f to 678f
+        }
+        density * min(width / density / rw, height / density / rh).coerceIn(0.84f, 1.12f)
+    }
+
+    /** A length given in reference points, in pixels. */
+    fun r(v: Float) = v * unit
+
     val visiblePages = if (landscape) 2 else 1
 
     /** Area in which the visible pages sit (window coordinates). */
@@ -41,122 +64,149 @@ class DeviceProfile(
     val pageH: Float
     /** Horizontal distance between page origins. */
     val pageStride: Float
+    /**
+     * Distance from the last visible slot to where the next page waits. In landscape that is
+     * past the screen edge, further than one stride: nothing shows under the dock at rest, and
+     * the incoming page slides in whole from behind it.
+     */
+    val pageStrideIn: Float
+    /**
+     * Distance from the first visible slot to where the previous page waits: just far enough
+     * left that its last column, labels included, is off the screen.
+     */
+    val pageStrideOut: Float
     /** Gutter between the two side-by-side pages in inner landscape. */
     var pageGap = 0f
         private set
 
-    val iconSize: Int
-    val labelSize: Float = dp(if (mode == Mode.COVER) 11.5f else 12.5f)
-    val labelGap: Float = dp(5f)
+    val iconSize: Int = r(60f).roundToInt()
+    val labelSize: Float = r(12f)
+    val labelGap: Float
     val labelH: Float = if (showLabels) labelSize * 1.3f else 0f
 
-    /** Vertical dock on the right: inner landscape and the cover screen (like iPhone Duo folded). */
+    /** Vertical dock in a rail on the right: inner landscape and the cover screen. */
     val dockVertical = mode != Mode.INNER_PORTRAIT
-    val dockIconSize: Int
+    val dockIconSize: Int = if (dockVertical) r(48f).roundToInt() else iconSize
+    /** Inner padding of the dock capsule and spacing between dock icons. */
+    val dockPad = r(if (dockVertical) 12f else 16f)
+    val dockGap = r(16f)
+    /** The dock capsule when it is full; with fewer icons the capsule shrinks around them. */
     val dockRect = RectF()
     val indicatorRect = RectF()
-    /** Right edge for page clipping in landscape so pages slide behind the dock. */
-    val workspaceClipRight: Int
+    /** The round search button: bottom of the rail, or right of the horizontal dock. */
+    val searchRect = RectF()
+    /** Centre line of the rail (dock, search and edit buttons), or of the screen in portrait. */
+    val railCenterX: Float
 
-    val folderCols = if (inner) 4 else 3
-    val cornerRadius = dp(if (inner) 34f else 30f)
-
-    /** Inner padding of the dock panel and spacing between dock icons. */
-    val dockPad = dp(if (mode == Mode.COVER) 12f else 18f)
-    val dockGap = dp(if (mode == Mode.COVER) 16f else 20f)
+    val folderCols = 3
+    val cornerRadius = r(36f)
 
     init {
-        // Tuned for balance on the Fold 8 rather than copied from iOS: comfortable outer
-        // margins, icon gaps of roughly a third of an icon, and horizontal spacing that matches
-        // the vertical rhythm of the rows.
         val W = width.toFloat()
         val H = height.toFloat()
-        val labelBlock = labelGap + labelH
-        var icon: Float
-        when (mode) {
-            Mode.INNER_LANDSCAPE -> {
-                val gridTop = insets.top + dp(14f)
-                val gridBottom = H - insets.bottom - dp(40f)
-                cellH = (gridBottom - gridTop) / ROWS
-                // Dock: 14dp from the right edge, generous inner padding.
-                val dockRight = W - insets.right - dp(14f)
-                val estIcon = min((cellH - labelBlock) * 0.8f, dp(60f))
-                val dIcon0 = estIcon * 0.9f
-                val dockLeft = dockRight - (dIcon0 + dockPad * 2)
-                val left = insets.left + dp(44f)
-                val right = dockLeft - dp(28f)
-                pageGap = dp(48f)
-                pageW = (right - left - pageGap) / 2f
-                cellW = pageW / COLS
-                icon = min(cellW * 0.62f, (cellH - labelBlock) * 0.86f).coerceAtMost(dp(60f))
+        val icon = iconSize.toFloat()
+        val search = r(48f)
+        val topIcon: Float
+        val bottomIcon: Float
+        val pitch: Float
+        val rowPitch: Float
+        fun rows(top: Float, bottom: Float, maxRatio: Float, p: Float): Triple<Float, Float, Float> {
+            // Spread six rows over the band; on a very tall screen stop growing and centre instead.
+            val free = (bottom - top - icon) / (ROWS - 1)
+            val rp = min(free, p * maxRatio)
+            val slack = (free - rp) * (ROWS - 1)
+            return Triple(rp, top + slack / 2f, bottom - slack / 2f)
+        }
+
+        if (dockVertical) {
+            val capsuleW = dockIconSize + dockPad * 2
+            val capsuleRight = W - insets.right - r(12f)
+            val capsuleLeft = capsuleRight - capsuleW
+            railCenterX = capsuleRight - capsuleW / 2f
+            val avail = capsuleLeft - insets.left
+            val top0 = max(insets.top + r(20f), r(54f))
+            val bottom0 = H - max(insets.bottom + r(48f), r(65f))
+            val gridLeft: Float
+            if (mode == Mode.INNER_LANDSCAPE) {
+                // avail = 2 pages (3 pitches + icon) + 3 equal spaces, each K icon gaps wide.
+                val k = 2.6f
+                pitch = (avail - 2 * icon + 3 * k * icon) / (6 + 3 * k)
+                val space = k * (pitch - icon)
+                gridLeft = insets.left + space
+                pageGap = icon + space - pitch
+            } else {
+                // One page: side margins equal to the gap between icons.
+                pitch = (avail + icon) / (COLS + 1)
+                gridLeft = insets.left + (pitch - icon)
+            }
+            // Rows a little taller than columns are wide, as on the Duo; the closed Fold is much
+            // taller than the closed Duo, so its rows may open up a bit more.
+            val (rp, t, b) = rows(top0, bottom0, if (landscape) 1.18f else 1.22f, pitch)
+            rowPitch = rp; topIcon = t; bottomIcon = b
+            cellW = pitch
+            pageW = pitch * COLS
+            val left = gridLeft - (pitch - icon) / 2f
+            if (landscape) {
                 pageStride = pageW + pageGap
-                pageH = gridBottom - gridTop
-                pagesRect.set(left, gridTop, right, gridBottom)
-                val dIcon = icon * 0.9f
-                val dockW = dIcon + dockPad * 2
-                val dockH = DOCK_MAX * dIcon + (DOCK_MAX - 1) * dockGap + dockPad * 2
-                val cy = (gridTop + gridBottom) / 2f
-                dockRect.set(dockRight - dockW, cy - dockH / 2f, dockRight, cy + dockH / 2f)
-                // No clipping: pages run under the dock to the screen edge.
-                workspaceClipRight = width
-                indicatorRect.set(left, gridBottom, right, H - insets.bottom)
-            }
-            Mode.COVER -> {
-                // 4x6 grid on the left, a narrow vertical dock on the right, centred on the grid.
-                val gridTop = insets.top + dp(12f)
-                val gridBottom = H - insets.bottom - dp(30f)
-                cellH = (gridBottom - gridTop) / ROWS
-                val dockRight = W - insets.right - dp(10f)
-                val estIcon = min((cellH - labelBlock) * 0.86f, dp(58f))
-                val dockLeft = dockRight - (estIcon * 0.86f + dockPad * 2)
-                val left = insets.left + dp(8f)
-                val right = dockLeft - dp(6f)
-                pageW = right - left
-                cellW = pageW / COLS
-                icon = min(cellW * 0.66f, (cellH - labelBlock) * 0.86f).coerceAtMost(dp(58f))
-                pageH = gridBottom - gridTop
-                pagesRect.set(left, gridTop, right, gridBottom)
+                // The waiting page's first icon sits 15pt past the right edge.
+                pageStrideIn = W + r(15f) - (gridLeft + pageStride)
+                pageStrideOut = left + pageW + r(2f)
+                pagesRect.set(left, 0f, left + 2 * pageW + pageGap, 0f)
+            } else {
                 pageStride = W
-                val dIcon = icon * 0.86f
-                val dockW = dIcon + dockPad * 2
-                val dockH = DOCK_MAX * dIcon + (DOCK_MAX - 1) * dockGap + dockPad * 2
-                val cy = (gridTop + gridBottom) / 2f
-                dockRect.set(dockRight - dockW, cy - dockH / 2f, dockRight, cy + dockH / 2f)
-                workspaceClipRight = width
-                indicatorRect.set(left, gridBottom, right, H - insets.bottom)
+                pageStrideIn = W
+                pageStrideOut = W
+                pagesRect.set(left, 0f, left + pageW, 0f)
             }
-            Mode.INNER_PORTRAIT -> {
-                val cover = false
-                val iconCap = dp(62f)
-                // Dock first (its height depends on the icon), then rows, then columns.
-                val estIcon = iconCap
-                val dockBottom = H - insets.bottom - dp(if (cover) 10f else 14f)
-                val dockTop = dockBottom - (estIcon + dockPad * 2)
-                val gridTop = insets.top + dp(if (cover) 14f else 20f)
-                val gridBottom = dockTop - dp(34f)
-                cellH = (gridBottom - gridTop) / ROWS
-                icon = min(iconCap, (cellH - labelBlock) * 0.84f)
-                val maxCellW = (W - insets.left - insets.right - dp(if (cover) 24f else 48f)) / COLS
-                // Columns roughly as far apart as rows, so spacing reads evenly both ways.
-                cellW = min(maxCellW, cellH * (if (cover) 1.12f else 1.05f))
-                pageW = cellW * COLS
-                pageH = gridBottom - gridTop
-                val left = (W - pageW) / 2f
-                pagesRect.set(left, gridTop, left + pageW, gridBottom)
-                pageStride = W
-                workspaceClipRight = width
-                val dockH = icon + dockPad * 2
-                // Dock slots line up with the grid columns.
-                dockRect.set(left, dockBottom - dockH, left + pageW, dockBottom)
-                indicatorRect.set(left, gridBottom, left + pageW, dockRect.top)
-            }
+            // The dock is centred on the icon grid, the search button sits in the rail's corner.
+            val dockH = DOCK_MAX * dockIconSize + (DOCK_MAX - 1) * dockGap + dockPad * 2
+            val cy = (topIcon + bottomIcon) / 2f
+            dockRect.set(capsuleLeft, cy - dockH / 2f, capsuleRight, cy + dockH / 2f)
+            val searchBottom = H - max(insets.bottom + r(10f), r(24f))
+            searchRect.set(railCenterX - search / 2f, searchBottom - search, railCenterX + search / 2f, searchBottom)
+        } else {
+            railCenterX = W / 2f
+            val avail = W - insets.left - insets.right
+            // Side margins about three icon gaps wide: the grid floats in the middle.
+            val k = 3.17f
+            pitch = (avail - icon + 2 * k * icon) / (COLS - 1 + 2 * k)
+            val gridLeft = insets.left + k * (pitch - icon)
+            val capsuleH = icon + dockPad * 2
+            val capsuleBottom = H - max(insets.bottom + r(6f), r(10f))
+            val capsuleTop = capsuleBottom - capsuleH
+            val dockW = DOCK_MAX * icon + (DOCK_MAX - 1) * dockGap + dockPad * 2
+            dockRect.set(W / 2f - dockW / 2f, capsuleTop, W / 2f + dockW / 2f, capsuleBottom)
+            val top0 = max(insets.top + r(44f), r(82f))
+            val bottom0 = capsuleTop - r(119f)
+            val (rp, t, b) = rows(top0, bottom0, 1.2f, pitch)
+            rowPitch = rp; topIcon = t; bottomIcon = b
+            cellW = pitch
+            pageW = pitch * COLS
+            val left = gridLeft - (pitch - icon) / 2f
+            pageStride = W
+            pageStrideIn = W
+            pageStrideOut = W
+            pagesRect.set(left, 0f, left + pageW, 0f)
+            val sx = W - insets.right - r(24f)
+            val scy = (capsuleTop + capsuleBottom) / 2f
+            searchRect.set(sx - search, scy - search / 2f, sx, scy + search / 2f)
         }
-        iconSize = icon.roundToInt()
-        dockIconSize = when (mode) {
-            Mode.INNER_LANDSCAPE -> (icon * 0.9f).roundToInt()
-            Mode.COVER -> (icon * 0.86f).roundToInt()
-            Mode.INNER_PORTRAIT -> iconSize
-        }
+
+        // Taller rows get a little more air between icon and label (5pt at 98pt rows, 11 at 118).
+        labelGap = r(5f) + ((rowPitch - r(98f)) * 0.3f).coerceIn(0f, r(6f))
+        cellH = rowPitch
+        pageH = rowPitch * ROWS
+        // Rows are placed so the first icon's top lands on topIcon (as laid out with labels shown).
+        val bandTop = topIcon - ((rowPitch - icon - labelGap - labelSize * 1.3f) / 2f).coerceAtLeast(0f)
+        pagesRect.top = bandTop
+        pagesRect.bottom = bandTop + pageH
+
+        // Page dots: between the last row's label and whatever is below (dock or screen edge).
+        val below = if (dockVertical) H - insets.bottom else dockRect.top
+        val labelBottom = bottomIcon + labelGap + labelSize * 1.4f
+        val dotsCy = (labelBottom + below) / 2f
+        val dotsH = r(36f)
+        indicatorRect.set(pagesRect.left, dotsCy - dotsH / 2f, pagesRect.right, dotsCy + dotsH / 2f)
     }
 
     /** Offset of the icon from the top of its cell, so icon+label are vertically centred. */

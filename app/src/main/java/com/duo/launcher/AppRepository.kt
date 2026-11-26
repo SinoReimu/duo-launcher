@@ -40,11 +40,8 @@ class AppInfo(
     val isSystem: Boolean,
 ) {
     @Volatile var icon: Bitmap? = null
-    /** Background colour of the icon (fallback for the launch card). */
-    @Volatile var color: Int = 0xFF2C2C2E.toInt()
-    /** The colour the app's own window starts with (its splash/window background), or 0. */
-    @Volatile var splash: Int = 0
-    val launchColor: Int get() = if (splash != 0) splash else color
+    /** Name of the icon's file in the disk cache (it encodes the app's version). */
+    @Volatile var iconFile: String? = null
     /** Lowercase label, full pinyin and pinyin initials, for Finder matching. */
     @Volatile var searchKeys: Array<String> = arrayOf(label.lowercase())
     val packageName: String get() = component.packageName
@@ -82,6 +79,7 @@ class AppRepository(private val context: Context) {
     val apps = LinkedHashMap<String, AppInfo>()
     var loaded = false
         private set
+    private val pendingRefresh = ArrayList<Pair<String, UserHandle>>()
     private val listeners = ArrayList<() -> Unit>()
     private val iconListeners = ArrayList<() -> Unit>()
 
@@ -92,34 +90,152 @@ class AppRepository(private val context: Context) {
     fun keyOf(cn: ComponentName, user: UserHandle) =
         cn.flattenToShortString() + "#" + userManager.getSerialNumberForUser(user)
 
+    /**
+     * True once the list comes from the system rather than from last time's cache. Only then may
+     * Home conclude that an app is new or gone.
+     */
+    @Volatile var authoritative = false
+        private set
+    /** The last authoritative list was the same as the cached one Home had already shown. */
+    var unchangedSinceCache = false
+        private set
+    /** Keys whose icons are wanted first (what Home shows), asked on the worker thread. */
+    @Volatile var firstIcons: () -> List<String> = { emptyList() }
+    private val listCache = File(context.cacheDir, "apps_v1.tsv")
+
+    /**
+     * Asking the system for every app's name takes about a second and a half on a cold start
+     * (150 apps: each label is read out of that app's own resources). So Home is first filled
+     * from what was found last time, names and icons straight off the disk, and the real query
+     * then runs behind it and only disturbs Home if something has changed.
+     */
     fun load() {
         worker.execute {
-            val list = queryAll()
+            val t0 = android.os.SystemClock.uptimeMillis()
+            val cached = readListCache()
+            if (cached.isNotEmpty()) {
+                main.post {
+                    if (!loaded) {
+                        apps.clear()
+                        cached.forEach { apps[it.key] = it }
+                        loaded = true
+                        listeners.forEach { it() }
+                    }
+                }
+                loadCachedIcons(cached)
+            }
+            val t1 = android.os.SystemClock.uptimeMillis()
+            val old = cached.associateBy { it.key }
+            val list = queryAll(old, cachedLocale == localeTag())
+            val t2 = android.os.SystemClock.uptimeMillis()
+            // What the cache already gave keeps its bitmap: same app, same version, same icon.
+            for (info in list) {
+                val o = old[info.key] ?: continue
+                if (o.icon != null && o.iconFile == info.iconFile) info.icon = o.icon
+            }
+            val same = cached.size == list.size && list.all { old[it.key]?.label == it.label && old[it.key]?.iconFile == it.iconFile }
             main.post {
                 apps.clear()
                 list.forEach { apps[it.key] = it }
                 loaded = true
+                authoritative = true
+                unchangedSinceCache = same
                 listeners.forEach { it() }
+                // Package events that arrived while the first query was running: apply them now.
+                val late = ArrayList(pendingRefresh)
+                pendingRefresh.clear()
+                late.forEach { (pkg, user) -> refreshPackage(pkg, user) }
             }
-            loadIcons(list)
+            loadIcons(list.filter { it.icon == null })
+            val t3 = android.os.SystemClock.uptimeMillis()
             computeSearchKeys(list)
-            list.forEach { it.splash = splashColor(it) }
+            writeListCache(list)
+            pruneIconCache(list)
+            dlog { "load: ${list.size} apps; from cache ${t1 - t0} ms (${cached.size}), query ${t2 - t1} ms, missing icons ${t3 - t2} ms, same=$same" }
         }
     }
 
-    private fun queryAll(): List<AppInfo> {
+    private fun localeTag() = context.resources.configuration.locales.toLanguageTags()
+    private var cachedLocale: String? = null
+
+    private fun readListCache(): List<AppInfo> = runCatching {
+        if (!listCache.exists()) return emptyList()
+        val out = ArrayList<AppInfo>()
+        listCache.forEachLine { line ->
+            if (line.startsWith("#locale=")) { cachedLocale = line.substring(8); return@forEachLine }
+            val f = line.split('\t', limit = 6)
+            if (f.size < 6) return@forEachLine
+            val cn = ComponentName.unflattenFromString(f[1]) ?: return@forEachLine
+            val user = userManager.getUserForSerialNumber(f[2].toLongOrNull() ?: return@forEachLine) ?: return@forEachLine
+            out += AppInfo(f[0], cn, user, f[5], f[3] == "1").also { it.iconFile = f[4].ifEmpty { null } }
+        }
+        out
+    }.getOrDefault(emptyList())
+
+    private fun writeListCache(list: List<AppInfo>) {
+        runCatching {
+            val tmp = File(listCache.parentFile, listCache.name + ".tmp")
+            tmp.bufferedWriter().use { w ->
+                w.write("#locale=" + localeTag()); w.newLine()
+                for (i in list) {
+                    w.write(listOf(
+                        i.key, i.component.flattenToString(), userManager.getSerialNumberForUser(i.user).toString(),
+                        if (i.isSystem) "1" else "0", i.iconFile.orEmpty(), i.label.replace('\t', ' ').replace('\n', ' '),
+                    ).joinToString("\t"))
+                    w.newLine()
+                }
+            }
+            tmp.renameTo(listCache)
+        }
+    }
+
+    /** Icons of a cached list, straight from their files; what Home shows comes first. */
+    private fun loadCachedIcons(list: List<AppInfo>) {
+        val want = runCatching { firstIcons() }.getOrDefault(emptyList())
+        val rank = HashMap<String, Int>().apply { want.forEachIndexed { i, k -> putIfAbsent(k, i) } }
+        var lastPost = 0L
+        for (info in list.sortedBy { rank[it.key] ?: Int.MAX_VALUE }) {
+            val name = info.iconFile ?: continue
+            info.icon = decodeIcon(File(iconDir, name)) ?: continue
+            val now = System.nanoTime()
+            if (now - lastPost > 30_000_000L) {
+                lastPost = now
+                main.post { iconListeners.forEach { it() } }
+            }
+        }
+        main.post { iconListeners.forEach { it() } }
+    }
+
+    /** Icon files of versions that are no longer installed. */
+    private fun pruneIconCache(list: List<AppInfo>) {
+        val keep = list.mapNotNullTo(HashSet()) { it.iconFile }
+        runCatching { iconDir.listFiles()?.forEach { if (it.name !in keep) it.delete() } }
+    }
+
+    /**
+     * Every launchable activity. An app's name is read out of that app's own resources, which
+     * is what makes this slow and, for a few seconds, maps a few hundred megabytes of other
+     * apps' packages into this process; so a name found last time is kept as long as the app
+     * has not been updated since (its icon file name says so) and the language is the same.
+     */
+    private fun queryAll(old: Map<String, AppInfo> = emptyMap(), sameLocale: Boolean = false): List<AppInfo> {
         val out = ArrayList<AppInfo>()
         for (user in launcherApps.profiles) {
-            for (ai in launcherApps.getActivityList(null, user)) out += toInfo(ai)
+            for (ai in launcherApps.getActivityList(null, user)) {
+                val key = keyOf(ai.componentName, ai.user)
+                val file = iconFileName(key, ai)
+                val known = old[key]?.takeIf { sameLocale && it.iconFile == file }
+                out += toInfo(ai, key, known?.label).also { it.iconFile = file }
+            }
         }
         return out.sortedBy { it.label.lowercase() }
     }
 
-    private fun toInfo(ai: LauncherActivityInfo) = AppInfo(
-        keyOf(ai.componentName, ai.user),
+    private fun toInfo(ai: LauncherActivityInfo, key: String = keyOf(ai.componentName, ai.user), label: String? = null) = AppInfo(
+        key,
         ai.componentName,
         ai.user,
-        ai.label?.toString()?.trim().orEmpty().ifEmpty { ai.componentName.packageName },
+        label ?: ai.label?.toString()?.trim().orEmpty().ifEmpty { ai.componentName.packageName },
         (ai.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
     ).also { it.tag = ai }
 
@@ -142,32 +258,34 @@ class AppRepository(private val context: Context) {
         main.post { iconListeners.forEach { it() } }
     }
 
-    private fun cacheFile(info: AppInfo): File {
-        val ai = info.tag
-        val stamp = runCatching {
-            context.packageManager.getPackageInfo(info.packageName, 0).lastUpdateTime
-        }.getOrDefault(0L)
-        val name = "v2_" + (info.key.hashCode().toUInt().toString(16)) + "_" + stamp + "_" + iconPx + "_" +
+    /** The icon's file: its name changes when the app is updated, so a stale one is never read. */
+    private fun iconFileName(key: String, ai: LauncherActivityInfo?): String {
+        val pkg = ai?.componentName?.packageName ?: key.substringBefore('/')
+        val stamp = runCatching { context.packageManager.getPackageInfo(pkg, 0).lastUpdateTime }.getOrDefault(0L)
+        return "v2_" + (key.hashCode().toUInt().toString(16)) + "_" + stamp + "_" + iconPx + "_" +
             (ai?.applicationInfo?.icon ?: 0) + ".png"
-        return File(iconDir, name)
     }
+
+    private fun cacheFile(info: AppInfo) = File(iconDir, info.iconFile ?: iconFileName(info.key, info.tag))
 
     private fun loadIcon(info: AppInfo): Bitmap? {
         val f = cacheFile(info)
-        if (f.exists()) {
-            BitmapFactory.decodeFile(f.path)?.let { sw ->
-                info.color = edgeColor(sw)
-                return sw.copy(Bitmap.Config.HARDWARE, false)?.also { sw.recycle() } ?: sw
-            }
-        }
+        info.iconFile = f.name
+        decodeIcon(f)?.let { return it }
         val ai = info.tag ?: return null
         val d = runCatching { ai.getIcon(context.resources.displayMetrics.densityDpi) }.getOrNull() ?: return null
         val badged = if (info.user != Process.myUserHandle())
             context.packageManager.getUserBadgedIcon(d, info.user) else d
         val bmp = render(badged)
-        info.color = edgeColor(bmp)
         runCatching { f.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) } }
         return bmp.copy(Bitmap.Config.HARDWARE, false) ?: bmp
+    }
+
+    /** A cached icon as a hardware bitmap (it lives in graphics memory, not on the Java heap). */
+    private fun decodeIcon(f: File): Bitmap? {
+        if (!f.exists()) return null
+        val sw = BitmapFactory.decodeFile(f.path) ?: return null
+        return sw.copy(Bitmap.Config.HARDWARE, false)?.also { sw.recycle() } ?: sw
     }
 
     private val mask by lazy { Squircle.path(iconPx.toFloat()) }
@@ -266,54 +384,6 @@ class AppRepository(private val context: Context) {
         tmp.recycle()
     }
 
-    /** Average colour just inside the icon's edges, i.e. its background. */
-    private fun edgeColor(b: Bitmap): Int {
-        val s = b.width
-        var r = 0; var g = 0; var bl = 0; var n = 0
-        val inset = (s * 0.1f).toInt()
-        for (k in 0 until 16) {
-            val t = inset + (s - 2 * inset) * k / 15
-            for ((x, y) in arrayOf(t to inset, t to s - 1 - inset, inset to t, s - 1 - inset to t)) {
-                val p = b.getPixel(x, y)
-                if ((p ushr 24) < 200) continue
-                r += (p shr 16) and 0xff; g += (p shr 8) and 0xff; bl += p and 0xff; n++
-            }
-        }
-        return if (n == 0) 0xFF2C2C2E.toInt() else Color.rgb(r / n, g / n, bl / n)
-    }
-
-    /**
-     * Resolves the launch activity's theme to find the colour its window starts with: the
-     * Android 12+ splash background, else a plain-colour window background. This makes the
-     * launch card match what the app paints first, so the system cross-fade is seamless.
-     */
-    private fun splashColor(info: AppInfo): Int = runCatching {
-        val pm = context.packageManager
-        val ai = pm.getActivityInfo(info.component, 0)
-        val themeRes = if (ai.themeResource != 0) ai.themeResource else ai.applicationInfo.theme
-        if (themeRes == 0) return 0
-        val pctx = context.createPackageContext(info.packageName, Context.CONTEXT_IGNORE_SECURITY)
-        val theme = pctx.resources.newTheme().apply { applyStyle(themeRes, true) }
-        val attrs = intArrayOf(
-            android.R.attr.windowSplashScreenBackground,
-            android.R.attr.windowBackground,
-            android.R.attr.colorBackground,
-        )
-        val tv = android.util.TypedValue()
-        for (attr in attrs) {
-            // One attribute per call: theme lookups don't need a sorted array that way.
-            val a = theme.obtainStyledAttributes(intArrayOf(attr))
-            try {
-                if (!a.getValue(0, tv)) continue
-                if (tv.type >= android.util.TypedValue.TYPE_FIRST_COLOR_INT &&
-                    tv.type <= android.util.TypedValue.TYPE_LAST_COLOR_INT) return tv.data or 0xFF000000.toInt()
-                val d = runCatching { a.getDrawable(0) }.getOrNull()
-                if (d is ColorDrawable) return d.color or 0xFF000000.toInt()
-            } finally { a.recycle() }
-        }
-        0
-    }.getOrDefault(0)
-
     private fun computeSearchKeys(list: List<AppInfo>) {
         val tr = runCatching { Transliterator.getInstance("Han-Latin; Latin-ASCII; Lower") }.getOrNull()
         for (info in list) {
@@ -347,14 +417,19 @@ class AppRepository(private val context: Context) {
             val fresh = launcherApps.getActivityList(pkg, user).map { toInfo(it) }
             fresh.forEach { it.icon = loadIcon(it) }
             computeSearchKeys(fresh)
-            fresh.forEach { it.splash = splashColor(it) }
             main.post {
+                // Before the first full list is in, `apps` is empty: telling listeners now would
+                // make every app on the Home Screen look uninstalled. Redo this after the load.
+                if (!loaded) { pendingRefresh += pkg to user; return@post }
                 val serial = "#" + userManager.getSerialNumberForUser(user)
                 apps.keys.filter { it.startsWith("$pkg/") && it.endsWith(serial) }.forEach { apps.remove(it) }
                 fresh.forEach { apps[it.key] = it }
                 val sorted = apps.values.sortedBy { it.label.lowercase() }
                 apps.clear(); sorted.forEach { apps[it.key] = it }
+                unchangedSinceCache = false
                 listeners.forEach { it() }
+                val snapshot = ArrayList(apps.values)
+                worker.execute { writeListCache(snapshot) }
             }
         }
     }
@@ -383,6 +458,31 @@ class AppRepository(private val context: Context) {
             .sortedWith(compareBy({ !it.isDeclaredInManifest }, { it.rank }))
             .take(4)
     }.getOrDefault(emptyList())
+
+    /** An app's shortcuts with their icons, as the long-press menu shows them. */
+    class Shortcut(val info: android.content.pm.ShortcutInfo, val icon: Drawable?)
+
+    @Volatile private var readyKey: String? = null
+    @Volatile private var readyAt = 0L
+    @Volatile private var ready: List<Shortcut> = emptyList()
+
+    private fun loadShortcuts(info: AppInfo) = shortcuts(info).map { Shortcut(it, shortcutIcon(it)) }
+
+    /**
+     * Asked when a finger goes down on an icon: the query and the icons are several calls into
+     * the system (some 70 ms together), and made when the menu opens they hold up its first
+     * frame. A long press takes half a second, which is plenty to have them ready.
+     */
+    fun prefetchShortcuts(info: AppInfo) {
+        if (readyKey == info.key && android.os.SystemClock.uptimeMillis() - readyAt < 1500) return
+        worker.execute {
+            val list = runCatching { loadShortcuts(info) }.getOrDefault(emptyList())
+            ready = list; readyKey = info.key; readyAt = android.os.SystemClock.uptimeMillis()
+        }
+    }
+
+    fun shortcutsWithIcons(info: AppInfo): List<Shortcut> =
+        if (readyKey == info.key && android.os.SystemClock.uptimeMillis() - readyAt < 4000) ready else loadShortcuts(info)
 
     fun shortcutIcon(s: android.content.pm.ShortcutInfo): Drawable? =
         runCatching { launcherApps.getShortcutIconDrawable(s, context.resources.displayMetrics.densityDpi) }.getOrNull()

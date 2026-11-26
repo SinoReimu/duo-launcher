@@ -115,12 +115,6 @@ class SpringValue(
     fun cancel() { endAction = null; anim.cancel() }
 }
 
-object Blur {
-    fun apply(v: View, radius: Float) {
-        v.setRenderEffect(if (radius < 0.5f) null else RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP))
-    }
-}
-
 fun lerp(a: Float, b: Float, t: Float) = a + (b - a) * t
 
 /**
@@ -159,4 +153,11 @@ class Jiggle(private val collect: (MutableList<View>) -> Unit) : Choreographer.F
         }
         Choreographer.getInstance().postFrameCallback(this)
     }
+}
+
+/** Diagnostics, off unless enabled with `adb shell setprop log.tag.DuoLauncher DEBUG`. */
+val debugLog: Boolean get() = android.util.Log.isLoggable("DuoLauncher", android.util.Log.DEBUG)
+
+inline fun dlog(msg: () -> String) {
+    if (debugLog) android.util.Log.d("DuoLauncher", msg())
 }

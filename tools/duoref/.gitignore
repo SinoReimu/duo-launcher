@@ -1,0 +1,5 @@
+build/
+run/
+DuoRef.xcodeproj/
+__pycache__/
+run.log

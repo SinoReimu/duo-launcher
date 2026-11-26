@@ -324,6 +324,7 @@ class FinderView(private val L: MainActivity) : FrameLayout(L) {
         list.alpha = ((t - 0.2f) / 0.8f).coerceIn(0f, 1f)
         list.translationY = lerp(p?.dp(40f) ?: 100f, 0f, a)
         L.setBackdrop(a, BackdropOwner.FINDER)
+        L.setChromeRecede(a)
     }
 
     // ---------------------------------------------------------------- swipe down to close

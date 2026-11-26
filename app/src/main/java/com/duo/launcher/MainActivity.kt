@@ -27,7 +27,7 @@ import androidx.dynamicanimation.animation.DynamicAnimation
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
-enum class BackdropOwner { FOLDER, FINDER, MENU }
+enum class BackdropOwner { FOLDER, FINDER, MENU, APP }
 
 class MainActivity : Activity() {
     lateinit var repo: AppRepository
@@ -48,11 +48,15 @@ class MainActivity : Activity() {
     lateinit var workspace: Workspace
     lateinit var dock: DockView
     lateinit var indicator: PageIndicator
+    private lateinit var searchButton: GlassButton
     private lateinit var editBar: EditBar
     lateinit var folder: FolderOverlay
     lateinit var finder: FinderView
     private lateinit var menu: ContextMenuOverlay
     private lateinit var launchCard: LaunchCard
+    private val cardActive get() = launchCard.active
+
+    private fun finishCards() = launchCard.finish()
     val drag = DragController(this)
     private var sheet: Sheet? = null
 
@@ -65,6 +69,7 @@ class MainActivity : Activity() {
     private var started = false
     private var stoppedSinceResume = false
     private var pausedSinceLaunch = true
+    private var stoppedSinceLaunch = true
     private var pendingUnlock = false
     private var lastLaunch = 0L
     private var lastLaunchedIcon: IconView? = null
@@ -89,6 +94,7 @@ class MainActivity : Activity() {
         workspace = Workspace(this)
         dock = DockView(this)
         indicator = PageIndicator(this)
+        searchButton = GlassButton(this, Glyph.SEARCH) { if (!editMode) finder.open() }
         editBar = EditBar(this)
         folder = FolderOverlay(this)
         finder = FinderView(this)
@@ -98,9 +104,17 @@ class MainActivity : Activity() {
         home.addView(workspace)
         home.addView(indicator)
         home.addView(dock)
+        home.addView(searchButton)
         content.addView(home, FrameLayout.LayoutParams(-1, -1))
+        homeBlur = HomeBlur(this, home).apply { visibility = View.INVISIBLE; alpha = 0f }
+        // Faded as they are drawn, not through an off-screen copy: at this screen size such a
+        // copy is 18 MB a time, and the renderer kept a hundred megabytes of them after one
+        // look at the Finder. Nothing in Home overlaps enough for the difference to show.
+        home.forceHasOverlappingRendering(false)
+        homeBlur.forceHasOverlappingRendering(false)
+        content.addView(homeBlur, FrameLayout.LayoutParams(-1, -1))
         root.addView(content, FrameLayout.LayoutParams(-1, -1))
-        root.addView(editBar)
+        editBar.attach(root)
         root.addView(folder, FrameLayout.LayoutParams(-1, -1))
         root.addView(finder, FrameLayout.LayoutParams(-1, -1))
         root.addView(launchCard, FrameLayout.LayoutParams(-1, -1))
@@ -123,6 +137,12 @@ class MainActivity : Activity() {
             if (r - l != or_ - ol || b - t != ob - ot) root.post { updateProfile() }
         }
 
+        repo.firstIcons = {
+            // Read on the worker thread while Home is being built: a snapshot, dock first.
+            runCatching { (model.dock.toList() + model.pages.toList().flatMap { it.toList() }).flatMap { item ->
+                when (item) { is AppItem -> listOf(item.key); is FolderItem -> item.apps.toList(); else -> emptyList() }
+            } }.getOrDefault(emptyList())
+        }
         repo.addListener { onAppsChanged() }
         repo.addIconListener { invalidateIcons() }
         repo.register()
@@ -143,8 +163,8 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        dlog { "life: onStart focus=${hasWindowFocus()}" }
         started = true
-        indicator.poke()
         workspace.settleNow()
         runCatching { widgetHost.startListening() }
         if (pendingUnlock) {
@@ -154,8 +174,21 @@ class MainActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
+        dlog { "life: onStop" }
         started = false
         stoppedSinceResume = true
+        stoppedSinceLaunch = true
+        // Fully covered now: drop what the launch animation left (full-screen card, zoomed
+        // Home), so that nothing of it can show if the app window is pulled away again.
+        if (!returnScheduled) {
+            finishCards()
+            content.cancelSprings()
+            content.scaleX = 1f; content.scaleY = 1f
+            content.translationX = 0f; content.translationY = 0f
+            content.alpha = 1f
+            appDepth.snap(0f)
+            sharpening = false
+        }
         runCatching { widgetHost.stopListening() }
         drag.cancel()
         menu.dismiss(immediate = true)
@@ -163,19 +196,23 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
+        dlog { "life: onPause" }
         pausedSinceLaunch = true
+        leftHomeAt = System.currentTimeMillis()
         // Interrupted mid-swipe (e.g. an app brought itself to the front): land on a page.
         workspace.settleNow()
     }
 
     override fun onResume() {
         super.onResume()
+        dlog { "life: onResume focus=${hasWindowFocus()}" }
         settleContent()
         stoppedSinceResume = false
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        dlog { "life: focus=$hasFocus" }
         // Focus arrives while One UI is still showing bare wallpaper, so it does not mean our
         // window is visible yet; a scheduled return keeps its own timing.
         if (hasFocus && !returnScheduled) settleContent()
@@ -191,11 +228,22 @@ class MainActivity : Activity() {
             if (!keyguard.isKeyguardLocked) playUnlock()
             return
         }
-        if (content.scaleX != 1f || content.alpha != 1f || content.translationX != 0f || launchCard.active) playReturnHome()
+        if (content.scaleX != 1f || content.alpha != 1f || content.translationX != 0f || cardActive || appDepth.value != 0f) playReturnHome()
+    }
+
+    override fun onTopResumedActivityChanged(isTop: Boolean) {
+        super.onTopResumedActivityChanged(isTop)
+        dlog { "life: topResumed=$isTop" }
+    }
+
+    override fun onEnterAnimationComplete() {
+        super.onEnterAnimationComplete()
+        dlog { "life: enterAnimationComplete" }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        dlog { "life: onNewIntent ${intent.action} ${intent.categories}" }
         if (intent.action != Intent.ACTION_MAIN) return
         // Home pressed while Home was already in front closes things, then goes to page 1.
         // Coming back from an app must not move pages: onNewIntent arrives after onStart there,
@@ -217,6 +265,11 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * The swipe-Home gesture's contract (AOSP Launcher3's GestureNavContract, which One UI's
+     * recents keeps): the Home intent names the app being left and carries a callback; Home
+     * answers with where that app's icon is, and the system shrinks the app's window into it.
+     */
     private fun handleBack() {
         when {
             menu.isShowing -> menu.dismiss()
@@ -234,6 +287,24 @@ class MainActivity : Activity() {
 
     // ================================================================ profile & layout
 
+    /**
+     * The first blurred backdrop after a rotation or fold used to cost a few frames of 20-60 ms
+     * (measured: the renderer sets up the blurred copy for the new screen shape on first use).
+     * So that is done here, out of sight, as soon as the shape is known: the copy is drawn for
+     * a couple of frames at the faintest alpha there is.
+     */
+    private fun warmBlur() {
+        root.postDelayed({
+            if (backdrop.max() > 0f || !::homeBlur.isInitialized) return@postDelayed
+            homeBlur.alpha = 0.005f
+            homeBlur.visibility = View.VISIBLE
+            homeBlur.invalidate()
+            root.postDelayed({
+                if (backdrop.max() <= 0f) { homeBlur.visibility = View.INVISIBLE; homeBlur.alpha = 0f }
+            }, 120)
+        }, 400)
+    }
+
     private fun updateProfile() {
         val w = root.width; val h = root.height
         if (w == 0 || h == 0) return
@@ -244,17 +315,24 @@ class MainActivity : Activity() {
         val old = profile
         if (np.sameShapeAs(old)) return
         profile = np
+        warmBlur()
         requestedOrientation = if (np.mode == Mode.COVER) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         else ActivityInfo.SCREEN_ORIENTATION_FULL_USER
         drag.cancel()
         menu.dismiss(immediate = true)
-        launchCard.finish()
+        finishCards()
         // Keep an open folder open across fold/unfold/rotation: close it now, reopen once laid out.
         val reopen = folder.folder
         folder.close(animate = false)
         sheet?.let { root.removeView(it); sheet = null }
         applyProfile(np)
         if (old != null) playModeTransition(old, np)
+        if (finder.isOpen) {
+            // Search stays open across a fold/rotation: the dock stays put away.
+            dock.cancelSprings(); dock.translationX = 0f; dock.translationY = 0f
+            lastRecede = -1f
+            setChromeRecede(1f)
+        }
         if (reopen != null) root.postDelayed({
             (viewCache[reopen.id] as? IconView)?.takeIf { it.isAttachedToWindow && it.isShown }?.let { folder.open(it) }
         }, 200)
@@ -270,17 +348,12 @@ class MainActivity : Activity() {
         fun lp(r: RectF) = FrameLayout.LayoutParams(r.width().roundToInt(), r.height().roundToInt()).apply {
             leftMargin = r.left.roundToInt(); topMargin = r.top.roundToInt()
         }
-        workspace.layoutParams = FrameLayout.LayoutParams(p.workspaceClipRight, FrameLayout.LayoutParams.MATCH_PARENT)
+        // Pages run under the dock to the screen edge: the workspace is the whole window.
+        workspace.layoutParams = FrameLayout.LayoutParams(-1, -1)
         indicator.layoutParams = lp(p.indicatorRect)
         dock.layoutParams = lp(p.dockRect)
-        // Edit-mode buttons sit in the (hidden) status-bar strip.
-        // "Done" keeps its edge margin (in line with the dock in landscape); "+" mirrors it.
-        val edge = if (p.landscape) p.width - p.dockRect.right else p.dp(16f)
-        editBar.layoutParams = FrameLayout.LayoutParams(-1, -2).apply {
-            topMargin = p.dpi(10f)
-            leftMargin = (edge + p.insets.left).roundToInt()
-            rightMargin = (if (p.landscape) edge else edge + p.insets.right).roundToInt()
-        }
+        searchButton.layoutParams = lp(p.searchRect)
+        editBar.layout(p)
         // Keep the visible page when the number of visible pages changes.
         val keep = workspace.currentPage
         rebindAll()
@@ -296,6 +369,8 @@ class MainActivity : Activity() {
         home.scaleX = 0.94f; home.scaleY = 0.94f
         home.springTo(DynamicAnimation.ALPHA, 1f, 260f, 1f)
         home.springScale(1f, 260f, 0.9f)
+        lastRecede = 0f
+        searchButton.setShown(!editMode, animate = false)
         if (old.dockVertical != p.dockVertical || old.mode != p.mode) {
             dock.cancelSprings()
             if (p.dockVertical) { dock.translationX = p.dp(140f); dock.translationY = 0f }
@@ -312,8 +387,8 @@ class MainActivity : Activity() {
         when (role) {
             Role.DOCK -> { v.iconSize = p.dockIconSize; v.showLabel = false }
             Role.HOME -> { v.iconSize = p.iconSize; v.showLabel = model.showLabels; v.iconTop = p.iconTop }
-            Role.FOLDER -> { v.iconSize = p.iconSize; v.showLabel = true; v.iconTop = p.dp(9f) }
-            Role.FINDER -> { v.iconSize = p.iconSize; v.showLabel = true; v.iconTop = p.dp(10f) }
+            Role.FOLDER -> { v.iconSize = p.iconSize; v.showLabel = true; v.iconTop = p.r(11f); v.labelGap = p.r(5f) }
+            Role.FINDER -> { v.iconSize = p.iconSize; v.showLabel = true; v.iconTop = p.dp(10f); v.labelGap = p.r(5f) }
         }
         v.invalidate()
     }
@@ -327,8 +402,12 @@ class MainActivity : Activity() {
 
     fun forgetView(item: HomeItem) { viewCache.remove(item.id) }
 
+    /** Home's views have been built from the model at least once. */
+    private var boundOnce = false
+
     fun rebindAll() {
         if (profile == null) return
+        boundOnce = true
         workspace.bind(model.pages)
         dock.setItems(model.dock)
         indicator.count = model.pages.size
@@ -358,20 +437,43 @@ class MainActivity : Activity() {
         return true
     }
 
-    fun onWorkspaceScrolled(pos: Float) {
-        if (indicator.pos != pos) {
-            indicator.pos = pos
-            indicator.poke()
+    private val holeRect = RectF()
+    private val holeRad = FloatArray(1)
+    private val holeA = Rect()
+    private val holeB = Rect()
+
+    /** Adds the rail's glass shapes (dock capsule, shown round buttons) to [out], in [ws] coordinates. */
+    fun addGlassHoles(out: android.graphics.Path, ws: View) {
+        if (!::editBar.isInitialized) return
+        holeB.set(0, 0, 0, 0); root.offsetDescendantRectToMyCoords(ws, holeB)
+        fun origin(v: View): Boolean {
+            if (!v.isAttachedToWindow || v.width == 0) return false
+            holeA.set(0, 0, 0, 0); root.offsetDescendantRectToMyCoords(v, holeA)
+            return true
         }
+        if (origin(dock) && dock.capsuleRect(holeRect, holeRad)) {
+            holeRect.offset((holeA.left - holeB.left).toFloat(), (holeA.top - holeB.top).toFloat())
+            out.addRoundRect(holeRect, holeRad[0], holeRad[0], android.graphics.Path.Direction.CW)
+        }
+        fun button(b: GlassButton) {
+            if (!b.shown || b.visibility != View.VISIBLE || !origin(b)) return
+            out.addCircle(holeA.left - holeB.left + b.width / 2f, holeA.top - holeB.top + b.height / 2f,
+                minOf(b.width, b.height) / 2f, android.graphics.Path.Direction.CW)
+        }
+        button(searchButton)
+        for (b in editBar.buttons) button(b)
     }
 
-    /** Any touch counts as use: the page dots stay while a finger is down, then fade 3 s later. */
-    override fun dispatchTouchEvent(e: MotionEvent): Boolean {
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> indicator.hold()
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> indicator.release()
-        }
-        return super.dispatchTouchEvent(e)
+    /** The set of pages behind the rail's glass changed: its backdrops re-record. */
+    fun invalidateGlass() {
+        if (!::editBar.isInitialized) return
+        dock.invalidate()
+        searchButton.invalidate()
+        for (b in editBar.buttons) b.invalidate()
+    }
+
+    fun onWorkspaceScrolled(pos: Float) {
+        if (indicator.pos != pos) indicator.pos = pos
     }
 
     fun invalidateIcons() {
@@ -391,22 +493,84 @@ class MainActivity : Activity() {
     private var backdrop = FloatArray(BackdropOwner.values().size)
     private var lastBackdrop = -1f
 
+    /** Scale currently applied to the Home layer (it recedes behind folders, menus and apps). */
+    val homeScale: Float get() = home.scaleX * content.scaleX
+
+    /**
+     * 0 = Home in front, 1 = an app in front. As on the iPhone, Home blurs, dims and recedes
+     * behind the app that is opening, and comes back with a long soft tail.
+     */
+    private val appDepth = SpringValue(0f, stiffness = 260f, damping = 1f) { v ->
+        val e = v.coerceIn(0f, 1f)
+        // Home only draws back a little behind the app, sharp and undimmed: enough for the app
+        // to seem to come forward (and Home to open out again when it leaves), and it moves the
+        // same way as the icon's own gesture, toward the middle.
+        setBackdrop(e * APP_RECEDE, BackdropOwner.APP)
+        // The icon's copy follows its icon, which has just moved.
+        if (launchCard.active) launchCard.invalidate()
+    }
+    private lateinit var homeBlur: HomeBlur
+
+    private fun smoothStep(e0: Float, e1: Float, x: Float): Float {
+        val t = ((x - e0) / (e1 - e0)).coerceIn(0f, 1f)
+        return t * t * (3 - 2 * t)
+    }
+
+
     /** Blur + recede the home screen behind folders, the finder and menus. */
     fun setBackdrop(t: Float, owner: BackdropOwner) {
         backdrop[owner.ordinal] = t
         val e = backdrop.max()
-        if (kotlin.math.abs(e - lastBackdrop) < 0.002f) return
+        // Always apply the exact rest state, however small the last step.
+        if (kotlin.math.abs(e - lastBackdrop) < 0.002f && !(e == 0f && lastBackdrop != 0f)) return
         lastBackdrop = e
         val p = profile ?: return
-        Blur.apply(home, p.dp(26f) * e)
+        // An app in front only makes Home recede here; its blur is HomeBlur's cross-fade.
+        var blur = 0f
+        for (o in BackdropOwner.values()) if (o != BackdropOwner.APP) blur = maxOf(blur, backdrop[o.ordinal])
+        // Sharp Home and a blurred copy of it cross-fade (see HomeBlur); the blur radius itself is
+        // never animated. A full-size blur whose radius changes every frame cost 20-35 ms a frame
+        // on the Fold 8 (measured on the search pull) and stepped visibly; the copy is a quarter
+        // of the size, blurred once.
+        val want = if (blur > 0.003f) View.VISIBLE else View.INVISIBLE
+        if (homeBlur.visibility != want) homeBlur.visibility = want
+        homeBlur.alpha = smoothStep(0f, 0.6f, blur)
+        // Never quite zero: Home keeps being drawn (invisibly, under its copy), so the frame in
+        // which it starts to show again has nothing to set up.
+        home.alpha = 1f - 0.99f * smoothStep(0.4f, 0.95f, blur)
         val s = 1f - 0.05f * e
         home.scaleX = s; home.scaleY = s
+        homeBlur.scaleX = s; homeBlur.scaleY = s
+    }
+
+    private var lastRecede = 0f
+
+    /**
+     * Search takes the whole screen: the dock slides off toward its edge and the search button
+     * fades, as on the Duo. Driven by the Finder's progress, so it follows the finger on a pull.
+     */
+    fun setChromeRecede(t: Float) {
+        val e = t.coerceIn(0f, 1f)
+        if (e == lastRecede) return
+        lastRecede = e
+        val p = profile ?: return
+        if (p.dockVertical) dock.translationX = e * (p.width - p.dockRect.left)
+        else dock.translationY = e * (p.height - p.dockRect.top)
+        val a = 1f - (e * 2f).coerceAtMost(1f)
+        searchButton.alpha = if (editMode) 0f else a
     }
 
     // ================================================================ apps
 
     private fun onAppsChanged() {
+        // An empty list is never the truth (it means "not loaded yet" or a failed query), and
+        // acting on it would strip the whole layout as uninstalled.
+        if (!repo.loaded || repo.apps.isEmpty()) return
+        // Filled from last time's cache while the system is still being asked: enough to show
+        // Home, not to decide that an app is new or gone.
+        if (!repo.authoritative) { if (model.initialized) rebindAll(); return }
         if (!model.initialized) buildDefaultLayout()
+        val before = model.known.size
         val present = repo.apps.keys
         // Newly installed apps.
         for (k in present) {
@@ -420,6 +584,8 @@ class MainActivity : Activity() {
         // Uninstalled apps.
         val gone = model.known.filter { it !in present }
         for (k in gone) { model.known -= k; model.removeKey(k); model.hidden -= k }
+        // The system's list confirmed what the cache had already put on screen: leave it be.
+        if (repo.unchangedSinceCache && boundOnce && gone.isEmpty() && model.known.size == before) return
         model.normalize(keepEmptyPages = false)
         ensureTrailingPage()
         rebindAll()
@@ -489,6 +655,7 @@ class MainActivity : Activity() {
         // A new launch interrupts a return that is still waiting to start.
         root.removeCallbacks(returnRunnable)
         returnScheduled = false
+        sharpening = false
         model.launchCounts[info.key] = (model.launchCounts[info.key] ?: 0) + 1
         save()
         var opts: Bundle? = null
@@ -510,8 +677,8 @@ class MainActivity : Activity() {
         } else ActivityOptions.makeBasic().toBundle()
         val withCard = own && from != null && from.isAttachedToWindow
         lastLaunchedInfo = info
-        if (withCard) launchCard.launch(from!!, info.icon, info.color)
-        if (own) playLaunch(bounds) else playFadeOut()
+        if (withCard) launchCard.launch(from!!, info.icon)
+        if (own) playLaunch() else playFadeOut()
         // Give the card a short head start so the zoom out of the icon reads before the system
         // fades the app window in on top of it.
         val start = Runnable {
@@ -522,24 +689,26 @@ class MainActivity : Activity() {
                 playReturnHome()
             }
         }
-        if (withCard) root.postDelayed(start, 140) else start.run()
+        if (withCard) root.postDelayed(start, 33) else start.run()
         if (finder.visibility == View.VISIBLE) root.postDelayed({ finder.close(animate = false) }, 350)
         // If the app never came up at all (we were never paused), undo the zoom. A slow cold
         // start (Camera) still pauses us, so it is left alone.
         pausedSinceLaunch = false
-        root.postDelayed({ if (!pausedSinceLaunch && hasWindowFocus()) playReturnHome() }, 2500)
+        stoppedSinceLaunch = false
+        val stamp = lastLaunch
+        root.postDelayed({ if (lastLaunch == stamp && !pausedSinceLaunch && hasWindowFocus()) playReturnHome() }, 2500)
+        // An app that opens as a pop-up or with a see-through window never covers Home (we are
+        // paused but not stopped): the full-screen card must not stay behind it.
+        root.postDelayed({
+            if (lastLaunch == stamp && pausedSinceLaunch && !stoppedSinceLaunch && started && !returnScheduled &&
+                (cardActive || content.alpha != 1f || appDepth.value != 0f)) runReturnHome()
+        }, 1000)
     }
 
-    /** Home zooms toward the tapped icon while the app grows out of it. */
-    private fun playLaunch(iconScreen: Rect?) {
-        val loc = IntArray(2)
-        content.getLocationOnScreen(loc)
-        movePivot(
-            (iconScreen?.exactCenterX() ?: (content.width / 2f)) - loc[0],
-            (iconScreen?.exactCenterY() ?: (content.height / 2f)) - loc[1],
-        )
-        content.springScale(1.08f, 260f, 1f)
-        content.springTo(DynamicAnimation.ALPHA, 0.55f, 260f, 1f)
+    /** Home blurs, dims and recedes while the app grows out of its icon. */
+    private fun playLaunch() {
+        appDepth.anim.spring.stiffness = 375f
+        appDepth.animateTo(1f)
     }
 
     /** System-animation mode, opening: the icons just fade out quickly while the app comes up. */
@@ -582,12 +751,18 @@ class MainActivity : Activity() {
      * the content is in, so a swipe-up during the launch animation reverses smoothly.
      */
     private var returnScheduled = false
+    /** How far Home draws back behind an app, as a share of the 5% it gives a folder or the Finder. */
+    private val APP_RECEDE = 0.5f
+    private var lastViaGesture = true
+    private var returnNow = false
+    /** Home is already on its way back to sharp (started when the finger lifted). */
+    private var sharpening = false
     private val returnRunnable = Runnable { runReturnHome() }
 
     private fun playReturnHome() {
         if (pendingUnlock || returnScheduled) return
         if (!model.appAnimation) {
-            launchCard.finish()
+            finishCards()
             lastLaunchedIcon?.resetTouchState()
             if (!hasWindowFocus()) {
                 // Really coming back. One UI shows bare wallpaper for a moment before our
@@ -607,29 +782,37 @@ class MainActivity : Activity() {
         // Window not focused yet = we are really coming back from another app (onStart/onResume),
         // as opposed to e.g. the launch fallback timer while Home is still in front.
         val realReturn = !hasWindowFocus()
-        if (realReturn) prepareReturnCard()
-        val atRest = content.scaleX == 1f && content.alpha == 1f
-        if (atRest && !launchCard.active) {
-            movePivot(content.width / 2f, content.height / 2f)
-            content.scaleX = 1.06f; content.scaleY = 1.06f
-            content.alpha = 0.6f
+        val viaGesture = if (realReturn) prepareReturnCard() else false
+        if (realReturn) {
+            // Our window is not on screen yet: take the starting pose outright (Home blurred,
+            // dim and receded behind the app), whatever the launch left behind.
+            content.cancelSprings()
+            content.translationX = 0f; content.translationY = 0f
+            content.scaleX = 1f; content.scaleY = 1f
+            content.alpha = 1f
+            appDepth.snap(1f)
         }
         lastLaunchedIcon?.resetTouchState()
         if (!realReturn) runReturnHome()
         else {
-            // One UI shows the wallpaper first and fades our window in ~150ms later; hold the
-            // starting pose until then so the shrink into the icon is actually seen.
+            // One UI fades our window in over a quarter of a second from when the finger lifts
+            // (after Back or the Home button it shows bare wallpaper first): the icon comes in
+            // once there is something of it to see.
             returnScheduled = true
-            // One UI shows ~200ms of bare wallpaper before fading our window in.
-            root.postDelayed(returnRunnable, 230)
+            root.postDelayed(returnRunnable, if (returnNow) 0 else if (viaGesture) 75 else 100)
+            // Home opens out from when the finger lifts: One UI is fading it in just then.
+            if (viaGesture) { appDepth.anim.spring.stiffness = 290f; appDepth.animateTo(0f); sharpening = true }
         }
     }
 
     private fun runReturnHome() {
         returnScheduled = false
         if (!model.appAnimation) { fadeHomeIn(); return }
-        content.springScale(1f, 320f, 0.9f)
+        content.springScale(1f, 320f, 1f)
         content.springTo(DynamicAnimation.ALPHA, 1f, 320f, 1f)
+        // Home takes its time to sharpen, well after the icon has landed.
+        if (!sharpening) { appDepth.anim.spring.stiffness = 320f; appDepth.animateTo(0f) }
+        sharpening = false
         if (launchCard.active) launchCard.retract()
         lastLaunchedIcon = null
         lastLaunchedInfo = null
@@ -637,54 +820,95 @@ class MainActivity : Activity() {
 
     /**
      * Decides which icon the closing app shrinks into. The app being left is not necessarily the
-     * one launched from here: the user may have switched apps in Recents, or opened one from a
-     * notification. With usage access the real last foreground app is known; without it, only
-     * our own launch is trusted.
+     * one launched from here: the user may have switched apps in Recents, opened one from a
+     * notification, or swiped the launched one away in Recents (then there is nothing to shrink).
+     * With usage access the app really in front is known; without it, only our own launch is.
      */
-    private fun prepareReturnCard() {
-        val pkg = foregroundPackageBeforeHome()
-        val info: AppInfo?
-        val target: IconView?
-        if (pkg == null) {
-            if (!launchCard.active) return
-            info = lastLaunchedInfo
-            target = lastLaunchedIcon
-        } else {
-            info = lastLaunchedInfo?.takeIf { it.packageName == pkg }
-                ?: repo.apps.values.firstOrNull { it.packageName == pkg && it.user == android.os.Process.myUserHandle() }
-                ?: repo.apps.values.firstOrNull { it.packageName == pkg }
-            target = returnTarget(pkg)
+    private fun prepareReturnCard(): Boolean {
+        // Home is back before the app had covered it (a quick swipe or Back right after the tap):
+        // the icon is still out from the launch and turns round where it is, at once.
+        returnNow = launchCard.opening
+        if (returnNow) return lastViaGesture
+        // Already on its way (Home is told more than once that it is coming back).
+        if (launchCard.returning) return lastViaGesture
+        val front = frontBeforeHome()
+        val info: AppInfo? = when {
+            // No usage access: trust our own launch, the best guess there is.
+            front == null -> lastLaunchedInfo
+            front.pkg.isEmpty() -> null
+            else -> lastLaunchedInfo?.takeIf { it.packageName == front.pkg }
+                ?: repo.apps.values.firstOrNull { it.packageName == front.pkg && it.user == android.os.Process.myUserHandle() }
+                ?: repo.apps.values.firstOrNull { it.packageName == front.pkg }
         }
-        if (info == null) { launchCard.finish(); return }
-        launchCard.prepareReturn(target, info.icon, info.color)
+        dlog { "return: front=${front?.pkg} gesture=${front?.viaGesture} app=${info?.key}" }
+        val viaGesture = front?.viaGesture ?: true
+        lastViaGesture = viaGesture
+        if (info == null) { finishCards(); return viaGesture }
+        launchCard.prepareReturn(locateReturnIcon(info), info.icon)
+        return viaGesture
     }
-
-    /** The on-screen icon of the app being left (a folder holding it counts), if any. */
-    private fun returnTarget(pkg: String?): IconView? =
-        if (pkg == null) lastLaunchedIcon?.takeIf { it.isAttachedToWindow && it.isShown }
-        else lastLaunchedIcon?.takeIf { it.isAttachedToWindow && iconShows(it, pkg) } ?: findVisibleIcon(pkg)
 
     private fun pkgOf(key: String) = repo[key]?.packageName
 
-    private fun iconShows(v: IconView, pkg: String): Boolean = when (val it = v.item) {
-        is AppItem -> pkgOf(it.key) == pkg
-        is FolderItem -> it.apps.any { k -> pkgOf(k) == pkg }
-        else -> false
+    /** True when [v] and everything up to the root is set visible (the window itself may not be yet). */
+    fun shownInRoot(v: View): Boolean {
+        var x: View? = v
+        while (x != null && x !== root) {
+            if (x.visibility != View.VISIBLE) return false
+            x = x.parent as? View
+        }
+        return x === root
     }
 
-    /** The app's icon on the pages currently on screen or in the dock (a folder counts). */
-    private fun findVisibleIcon(pkg: String): IconView? {
-        var folderHit: IconView? = null
-        val containers = workspace.pages.filter { it.visibility == View.VISIBLE && it.alpha >= 1f } + dock
-        for (c in containers) for (i in 0 until c.childCount) {
-            val v = c.getChildAt(i) as? IconView ?: continue
-            when (val it = v.item) {
-                is AppItem -> if (pkgOf(it.key) == pkg) return v
-                is FolderItem -> if (folderHit == null && it.apps.any { k -> pkgOf(k) == pkg }) folderHit = v
-                else -> {}
-            }
+    /**
+     * The icon the app being left should shrink into, brought on screen if need be: the icon it
+     * was opened from when that is still there (also inside an open folder), else its icon in
+     * the dock, else on a page, turning to that page first like iOS does. A folder holding the
+     * app stands in for it. Null when the app is not on the Home Screen at all.
+     */
+    private fun locateReturnIcon(info: AppInfo): IconView? {
+        val pkg = info.packageName
+        fun holds(it: HomeItem, exact: Boolean): Boolean = when (it) {
+            is AppItem -> if (exact) it.key == info.key else pkgOf(it.key) == pkg
+            is FolderItem -> it.apps.any { k -> if (exact) k == info.key else pkgOf(k) == pkg }
+            else -> false
         }
-        return folderHit
+        lastLaunchedIcon?.let { v ->
+            if (v.role != Role.FINDER && v.isAttachedToWindow && shownInRoot(v) && holds(v.item, false) &&
+                v.width > 0 && onScreen(v)) return v
+        }
+        // An open folder that is not where we are going would cover the landing.
+        if (folder.isOpen) folder.close(animate = false)
+        for (exact in booleanArrayOf(true, false)) {
+            model.dock.firstOrNull { holds(it, exact) }?.let { return viewFor(it, Role.DOCK) as? IconView }
+        }
+        val vis = profile?.visiblePages ?: 1
+        val cur = workspace.currentPage
+        // Best page hit: the exact activity before another one of the same package, the app's
+        // own icon before a folder holding it, a page already on screen before a page turn.
+        var best: HomeItem? = null
+        var bestPage = -1
+        var bestScore = Int.MAX_VALUE
+        for ((pi, page) in model.pages.withIndex()) for (it in page) {
+            val exact = holds(it, true)
+            if (!exact && !holds(it, false)) continue
+            val score = (if (exact) 0 else 4) + (if (it is AppItem) 0 else 2) + (if (pi in cur until cur + vis) 0 else 1)
+            if (score < bestScore) { best = it; bestPage = pi; bestScore = score }
+        }
+        val item = best ?: return null
+        if (bestPage !in cur until cur + vis) {
+            val to = if (bestPage < cur) bestPage else bestPage - (vis - 1)
+            workspace.snapTo(to, animate = false)
+        }
+        return viewFor(item, Role.HOME) as? IconView
+    }
+
+    /** Whether the centre of [v] is inside the window (pages off to the side are not). */
+    private fun onScreen(v: View): Boolean {
+        val loc = IntArray(2)
+        v.getLocationInWindow(loc)
+        val cx = loc[0] + v.width * v.scaleX / 2f
+        return cx > 0 && cx < root.width
     }
 
     fun hasUsageAccess(): Boolean {
@@ -694,24 +918,64 @@ class MainActivity : Activity() {
         ) == android.app.AppOpsManager.MODE_ALLOWED
     }
 
-    /** Package of the last activity in front before Home, "" if none, null if unknown. */
-    private fun foregroundPackageBeforeHome(): String? {
+    /**
+     * What was in front when Home was asked for: [pkg] is "" when no app window is on its way
+     * out (Home came up from the Recents overview, where the last app had already left the
+     * screen or was swiped away). [viaGesture]: the swipe-up gesture is bringing us back, during
+     * which the system itself shrinks the app window to a card.
+     */
+    private class Front(val pkg: String, val viaGesture: Boolean)
+
+    /** The package that draws Recents (and handles the Home gesture) on this device. */
+    private val recentsPackage: String? by lazy {
+        runCatching {
+            val res = android.content.res.Resources.getSystem()
+            val id = res.getIdentifier("config_recentsComponentName", "string", "android")
+            android.content.ComponentName.unflattenFromString(res.getString(id))?.packageName
+        }.getOrNull()
+    }
+
+    /** Wall-clock time Home last left the foreground; activity events after it tell what is in front. */
+    private var leftHomeAt = 0L
+
+    /** Null without usage access. */
+    private fun frontBeforeHome(): Front? {
         if (!hasUsageAccess()) return null
         return runCatching {
             val usm = getSystemService(android.app.usage.UsageStatsManager::class.java)
             val now = System.currentTimeMillis()
-            val events = usm.queryEvents(now - 10 * 60_000L, now + 1_000L)
+            val begin = if (leftHomeAt in 1..now) leftHomeAt - 3_000L else now - 60 * 60_000L
+            val events = usm.queryEvents(begin, now + 1_000L)
             val e = android.app.usage.UsageEvents.Event()
-            var last = ""
+            var pkg = ""
+            var cls: String? = null
+            var stopped = false
+            var recents = false
+            val tail = if (debugLog) ArrayDeque<String>() else null
             while (events.hasNextEvent()) {
                 events.getNextEvent(e)
                 val t = e.eventType
-                if ((t == android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED ||
-                        t == android.app.usage.UsageEvents.Event.ACTIVITY_PAUSED) && e.packageName != packageName) {
-                    last = e.packageName
+                val resumed = t == android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED
+                val stop = t == android.app.usage.UsageEvents.Event.ACTIVITY_STOPPED
+                if (!resumed && !stop) continue
+                val p = e.packageName ?: continue
+                tail?.let { it += "${now - e.timeStamp}ms ${if (resumed) "resumed" else "stopped"} $p/${e.className?.substringAfterLast('.')}"; if (it.size > 10) it.removeFirst() }
+                if (p == packageName) {
+                    // Home itself was in front again: whatever came before is not what we return from.
+                    if (resumed) { pkg = ""; cls = null; stopped = false; recents = false }
+                    continue
                 }
+                val isRecents = p == recentsPackage && e.className?.contains("Recents") == true
+                if (resumed) {
+                    // The Recents activity also runs under the Home gesture; it is never "the app".
+                    if (isRecents) recents = true
+                    else { pkg = p; cls = e.className; stopped = false; recents = false }
+                } else if (p == pkg && e.className == cls) stopped = true
             }
-            last
+            tail?.let { dlog { "events since leaving Home:\n" + it.joinToString("\n") } }
+            // An app that was stopped is no longer on screen: it sat in the Recents overview (or
+            // was swiped away there). During the gesture and after Back/Home it is only paused.
+            Front(if (stopped) "" else pkg, recents)
         }.getOrNull()
     }
 
@@ -783,7 +1047,8 @@ class MainActivity : Activity() {
         jiggle.start()
         window.insetsController?.hide(WindowInsets.Type.statusBars())
         editBar.setShown(true)
-        indicator.hold()
+        searchButton.setShown(false)
+        indicator.setEditing(true)
         invalidateIcons()
     }
 
@@ -797,7 +1062,8 @@ class MainActivity : Activity() {
         jiggle.stop()
         window.insetsController?.show(WindowInsets.Type.statusBars())
         editBar.setShown(false)
-        indicator.release()
+        searchButton.setShown(true)
+        indicator.setEditing(false)
         invalidateIcons()
         save()
     }
@@ -888,11 +1154,11 @@ class MainActivity : Activity() {
         val rect = RectF()
         val snap = if (v is IconView || v is WidgetContainer) drag.snapshot(v, rect) else null
         val actions = ArrayList<MenuAction>()
-        val editAction = MenuAction(t("编辑主屏幕", "Edit Home Screen"), separatorBefore = true) { enterEditMode() }
+        val editAction = MenuAction(t("编辑主屏幕", "Edit Home Screen"), separatorBefore = true, glyph = MenuGlyph.EDIT) { enterEditMode() }
         when {
             v is WidgetContainer -> {
                 val info = widgetManager.getAppWidgetInfo(v.item.widgetId)
-                if (info?.configure != null) actions += MenuAction(t("编辑小组件", "Edit Widget")) {
+                if (info?.configure != null) actions += MenuAction(t("编辑小组件", "Edit Widget"), glyph = MenuGlyph.TUNE) {
                     runCatching { widgetHost.startAppWidgetConfigureActivityForResult(this, v.item.widgetId, 0, REQ_RECONFIG, null) }
                 }
                 for ((label, sx, sy) in listOf(
@@ -901,43 +1167,43 @@ class MainActivity : Activity() {
                     Triple(t("大 4×4", "Large 4×4"), 4, 4),
                 )) {
                     if (v.item.sx == sx && v.item.sy == sy) continue
-                    actions += MenuAction(label) { resizeWidget(v.item, sx, sy) }
+                    actions += MenuAction(label, glyph = MenuGlyph.RESIZE) { resizeWidget(v.item, sx, sy) }
                 }
                 actions += editAction
-                actions += MenuAction(t("移除小组件", "Remove Widget"), destructive = true) { onRemoveBadge(v) }
+                actions += MenuAction(t("移除小组件", "Remove Widget"), destructive = true, glyph = MenuGlyph.REMOVE) { onRemoveBadge(v) }
             }
             v is IconView && v.item is FolderItem -> {
                 val f = v.item as FolderItem
-                actions += MenuAction(t("重命名", "Rename")) { folder.open(v) }
+                actions += MenuAction(t("重命名", "Rename"), glyph = MenuGlyph.RENAME) { folder.open(v) }
                 actions += editAction
-                actions += MenuAction(t("从主屏幕移除", "Remove from Home Screen"), destructive = true) {
+                actions += MenuAction(t("从主屏幕移除", "Remove from Home Screen"), destructive = true, glyph = MenuGlyph.REMOVE) {
                     removeWithAnimation(v) { model.remove(f); forgetView(f) }
                 }
             }
             v is IconView -> {
                 val info = v.appInfo ?: return
-                for (s in repo.shortcuts(info)) {
-                    actions += MenuAction(s.shortLabel?.toString() ?: "", repo.shortcutIcon(s)) {
-                        repo.startShortcut(s, null)
+                for (sc in repo.shortcutsWithIcons(info)) {
+                    actions += MenuAction(sc.info.shortLabel?.toString() ?: "", sc.icon) {
+                        repo.startShortcut(sc.info, null)
                     }
                 }
                 if (v.role != Role.FINDER) actions += editAction
                 if (v.role == Role.FINDER && !model.isOnHome(info.key)) {
-                    actions += MenuAction(t("添加到主屏幕", "Add to Home Screen"), separatorBefore = actions.isNotEmpty()) {
+                    actions += MenuAction(t("添加到主屏幕", "Add to Home Screen"), separatorBefore = actions.isNotEmpty(), glyph = MenuGlyph.ADD) {
                         model.appendToHome(AppItem(Ids.new(), info.key)); rebindAll(); save()
                     }
                 }
                 if (v.role == Role.HOME || v.role == Role.DOCK) {
-                    actions += MenuAction(t("从主屏幕移除", "Remove from Home Screen")) {
+                    actions += MenuAction(t("从主屏幕移除", "Remove from Home Screen"), glyph = MenuGlyph.REMOVE) {
                         removeWithAnimation(v) { model.remove(v.item); forgetView(v.item) }
                     }
                 }
                 if (v.role == Role.FOLDER) {
-                    actions += MenuAction(t("移出文件夹", "Remove from Folder")) { onRemoveBadge(v) }
+                    actions += MenuAction(t("移出文件夹", "Remove from Folder"), glyph = MenuGlyph.REMOVE) { onRemoveBadge(v) }
                 }
-                actions += MenuAction(t("隐藏 App", "Hide App")) { if (v.role == Role.FOLDER) folder.close(animate = false); hideApp(info.key) }
-                actions += MenuAction(t("App 信息", "App Info")) { repo.openDetails(info) }
-                if (!info.isSystem) actions += MenuAction(t("卸载 App", "Uninstall App"), destructive = true) {
+                actions += MenuAction(t("隐藏 App", "Hide App"), glyph = MenuGlyph.HIDE) { if (v.role == Role.FOLDER) folder.close(animate = false); hideApp(info.key) }
+                actions += MenuAction(t("App 信息", "App Info"), glyph = MenuGlyph.INFO) { repo.openDetails(info) }
+                if (!info.isSystem) actions += MenuAction(t("卸载 App", "Uninstall App"), destructive = true, glyph = MenuGlyph.TRASH) {
                     runCatching {
                         startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${info.packageName}")))
                     }

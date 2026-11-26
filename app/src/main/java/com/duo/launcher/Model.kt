@@ -82,7 +82,7 @@ class HomeModel {
     var searchHidden = false
     var doubleTapLock = true
     /** Launcher-drawn app open/close motion; off = leave it entirely to the system. */
-    var appAnimation = false
+    var appAnimation = true
     var initialized = false
 
     fun allItems(): Sequence<HomeItem> = pages.asSequence().flatten() + dock.asSequence()
@@ -207,7 +207,7 @@ class HomeModel {
         showLabels = o.optBoolean("labels", true)
         searchHidden = o.optBoolean("searchHidden", false)
         doubleTapLock = o.optBoolean("dtLock", true)
-        appAnimation = o.optBoolean("appAnim", false)
+        appAnimation = o.optBoolean("appAnim", true)
         initialized = true
     }
 }

@@ -207,51 +207,109 @@ class PageView(L: MainActivity) : ItemContainer(L, Role.HOME) {
     }
 }
 
-/** The dock: a glass panel with up to DOCK_MAX items, vertical in inner landscape. */
+/**
+ * The dock: a glass capsule that hugs its icons (up to DOCK_MAX), vertical in the rail modes.
+ * The view always covers the full-size capsule; the drawn capsule grows and shrinks with the
+ * number of icons on a spring, so adding or dragging one out reads as the glass stretching.
+ */
 @SuppressLint("ViewConstructor")
 class DockView(L: MainActivity) : ItemContainer(L, Role.DOCK) {
-    private val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x30FFFFFF }
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; color = 0x38FFFFFF
-    }
+    private val bg = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val rect = RectF()
+    /** Drawn length of the capsule along the dock axis, in pixels. */
+    private val capLen = SpringValue(0f, stiffness = 320f, damping = 0.82f) {
+        invalidate()
+        // The workspace cuts the capsule out of its pages (see GlassBackdrop).
+        if (vertical) L.workspace.invalidate()
+    }
+    private var capTarget = -1f
+    init { capLen.anim.minimumVisibleChange = 0.5f }
+    private val capsule = android.graphics.Path()
+    private val backdrop = GlassBackdrop(L, this)
+
+    /**
+     * The capsule as currently drawn, in this view's coordinates; false when there is none
+     * (empty dock). Returns the corner radius through [radius].
+     */
+    fun capsuleRect(out: RectF, radius: FloatArray? = null): Boolean {
+        val p = L.profile ?: return false
+        val len = capLen.value
+        if (len < lengthFor(1) * 0.5f || width == 0) return false
+        if (vertical) out.set(0f, (height - len) / 2f, width.toFloat(), (height + len) / 2f)
+        else out.set((width - len) / 2f, 0f, (width + len) / 2f, height.toFloat())
+        // Concentric with the icons: icon corner radius plus the padding.
+        radius?.set(0, min(p.dockIconSize * 0.225f + p.dockPad, min(out.width(), out.height()) / 2f))
+        return true
+    }
+    private val rad = FloatArray(1)
+    private var shaderW = 0
+    private var shaderH = 0
 
     init { setWillNotDraw(false) }
 
     val vertical get() = L.profile?.dockVertical == true
 
+    private fun lengthFor(n: Int): Float {
+        val p = L.profile ?: return 0f
+        if (n <= 0) return 0f
+        return n * p.dockIconSize + (n - 1) * p.dockGap + p.dockPad * 2
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        // New geometry (fold, rotate): no stretch animation from the old axis.
+        capTarget = lengthFor(items.size)
+        capLen.snap(capTarget)
+    }
+
     override fun onDraw(c: Canvas) {
         val p = L.profile ?: return
+        val len = capLen.value
+        val full = lengthFor(1)
+        if (len < full * 0.5f) return
+        // Fades in from nothing when the first icon arrives.
+        val a = ((len - full * 0.5f) / (full * 0.5f)).coerceIn(0f, 1f)
+        if (shaderW != width || shaderH != height) {
+            shaderW = width; shaderH = height
+            // Liquid-glass feel without a backdrop blur: a faint milky fill that is a touch
+            // brighter at the top, and a hairline rim lit from the top-left.
+            bg.shader = android.graphics.LinearGradient(
+                0f, 0f, 0f, height.toFloat(), 0x3DFFFFFF, 0x24FFFFFF, android.graphics.Shader.TileMode.CLAMP)
+            stroke.shader = android.graphics.LinearGradient(
+                0f, 0f, width.toFloat(), height.toFloat(),
+                intArrayOf(0x8CFFFFFF.toInt(), 0x1FFFFFFF, 0x52FFFFFF), floatArrayOf(0f, 0.55f, 1f),
+                android.graphics.Shader.TileMode.CLAMP)
+        }
+        bg.alpha = (255 * a).toInt()
+        stroke.alpha = (255 * a).toInt()
         stroke.strokeWidth = p.dp(1f)
-        rect.set(0f, 0f, width.toFloat(), height.toFloat())
-        val r = min(p.dp(30f), min(width, height) * 0.42f)
+        if (!capsuleRect(rect, rad)) return
+        val r = rad[0]
+        capsule.rewind(); capsule.addRoundRect(rect, r, r, android.graphics.Path.Direction.CW)
+        backdrop.draw(c, capsule)
         c.drawRoundRect(rect, r, r, bg)
         rect.inset(stroke.strokeWidth / 2, stroke.strokeWidth / 2)
         c.drawRoundRect(rect, r, r, stroke)
     }
 
-    fun slotLength(): Float {
-        val len = if (vertical) height else width
-        return len / DOCK_MAX.toFloat()
-    }
-
-    /** Position of slot i (of n) along the dock axis: start and length. */
+    /** Position of slot i (of n) along the dock axis: start and length. Fixed pitch, centred. */
     private fun slot(i: Int, n: Int): Pair<Float, Float> {
-        val p = L.profile
-        if (vertical && p != null) {
-            // Vertical dock: fixed icon pitch with the panel's inner padding, centred.
-            val pitch = p.dockIconSize + p.dockGap
-            val total = n * p.dockIconSize + (n - 1).coerceAtLeast(0) * p.dockGap
-            val start = (height - total) / 2f
-            return (start + i * pitch - p.dockGap / 2f) to pitch
-        }
-        val s = slotLength()
+        val p = L.profile ?: return 0f to 0f
+        val pitch = p.dockIconSize + p.dockGap
+        val total = n * p.dockIconSize + (n - 1).coerceAtLeast(0) * p.dockGap
         val len = if (vertical) height else width
-        return ((len - s * n) / 2f + i * s) to s
+        val start = (len - total) / 2f
+        return (start + i * pitch - p.dockGap / 2f) to pitch
     }
 
     override fun computeFrames(): Array<Rect?> {
         val n = items.size
+        val target = lengthFor(n)
+        if (target != capTarget) {
+            capTarget = target
+            if (L.suppressReflow || !isLaidOut) capLen.snap(target) else capLen.animateTo(target)
+        }
         return Array(n) { i ->
             val (a0, l) = slot(i, n)
             val a = a0.roundToInt(); val b = (a0 + l).roundToInt()

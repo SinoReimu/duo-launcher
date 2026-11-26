@@ -18,7 +18,11 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-/** iOS-style open folder: blurred background, glass panel that grows out of the folder icon. */
+/**
+ * iOS-style open folder: blurred background, glass panel that grows out of the folder icon.
+ * As on the iPhone Duo the panel is a fixed 3x3 window (more apps scroll), spaced like the Home
+ * grid, and in landscape it opens over the page that holds the folder rather than mid-screen.
+ */
 @SuppressLint("ViewConstructor")
 class FolderOverlay(private val L: MainActivity) : FrameLayout(L) {
     var folder: FolderItem? = null
@@ -88,28 +92,41 @@ class FolderOverlay(private val L: MainActivity) : FrameLayout(L) {
         title.setText(f.name)
 
         val cols = p.folderCols
-        val cellW = (p.iconSize * 1.55f).roundToInt()
-        val cellH = (p.iconSize + p.labelGap + p.labelH + p.dp(18f)).roundToInt()
+        // Same column pitch as the landscape Home grid (88pt) and rows of 103pt.
+        val cellW = p.r(88f).roundToInt()
+        val cellH = p.r(103f).roundToInt()
         grid.cols = cols; grid.cellW = cellW; grid.cellH = cellH
         val rowsAll = max(1, ceil(items.size / cols.toFloat()).toInt())
-        val rows = min(rowsAll, cols)
-        val pad = p.dp(22f).roundToInt()
-        val pw = cols * cellW + pad * 2
-        val ph = rows * cellH + pad * 2
-        grid.layoutParams = LayoutParams(cols * cellW, max(rowsAll, 1) * cellH + cellH)
-        scroll.layoutParams = LayoutParams(cols * cellW, rows * cellH).apply { leftMargin = pad; topMargin = pad }
-        val cx = L.root.width / 2f
-        val cy = L.root.height / 2f - p.dp(10f)
+        val rows = cols
+        val padX = p.r(13f).roundToInt()
+        val padY = p.r(18f).roundToInt()
+        val pw = cols * cellW + padX * 2
+        val ph = rows * cellH + padY * 2
+        // One spare row only when the folder scrolls, as the drop target for a dragged icon.
+        grid.layoutParams = LayoutParams(cols * cellW, max(rowsAll + if (rowsAll >= rows) 1 else 0, rows) * cellH)
+        scroll.layoutParams = LayoutParams(cols * cellW, rows * cellH).apply { leftMargin = padX; topMargin = padY }
+        iconRectInRoot(icon, source)
+        val W = L.root.width.toFloat()
+        // Over the folder's own page; a folder in the dock opens over the grid as a whole.
+        var cx = (p.pagesRect.left + p.pagesRect.right) / 2f
+        if (p.landscape && icon.role == Role.HOME) {
+            val firstPageRight = p.pagesRect.left + p.pageW + p.pageGap / 2f
+            cx = if (source.centerX() < firstPageRight) p.pagesRect.left + p.pageW / 2f
+            else p.pagesRect.left + p.pageStride + p.pageW / 2f
+        }
+        cx = cx.coerceIn(pw / 2f + p.r(8f), W - pw / 2f - p.r(8f))
+        // The title sits above the panel: keep the pair, not the panel alone, centred.
+        val cy = (p.insets.top + L.root.height - p.insets.bottom) / 2f + p.r(14f)
         target.set(cx - pw / 2f, cy - ph / 2f, cx + pw / 2f, cy + ph / 2f)
         panel.layoutParams = LayoutParams(pw, ph).apply { leftMargin = target.left.roundToInt(); topMargin = target.top.roundToInt() }
-        panel.background = GradientDrawable().apply {
-            cornerRadius = p.dp(38f); setColor(0x45FFFFFF); setStroke(p.dpi(1f), 0x30FFFFFF)
-        }
+        panel.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0x3DFFFFFF, 0x26FFFFFF),
+        ).apply { cornerRadius = p.cornerRadius; setStroke(p.dpi(1f), 0x59FFFFFF) }
+        title.setTextSize(TypedValue.COMPLEX_UNIT_PX, p.r(30f))
         title.layoutParams = LayoutParams(pw, LayoutParams.WRAP_CONTENT).apply {
-            leftMargin = target.left.roundToInt(); topMargin = (target.top - p.dp(64f)).roundToInt()
+            leftMargin = target.left.roundToInt(); topMargin = (target.top - p.r(70f)).roundToInt()
         }
         grid.setItems(items)
-        iconRectInRoot(icon, source)
         visibility = VISIBLE
         icon.visibility = INVISIBLE
         progress.animateTo(1f)

@@ -54,8 +54,8 @@ class WidgetContainer(private val L: MainActivity, val item: WidgetItem) : Frame
     private var downY = 0f
     private var longPressed = false
     private var stolen = false
-    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xE6595959.toInt() }
-    private val badgeLine = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFFFFFF.toInt(); strokeCap = Paint.Cap.ROUND }
+    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xEBE4E4E8.toInt() }
+    private val badgeLine = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF3C3C43.toInt(); strokeCap = Paint.Cap.ROUND }
 
     init {
         clipToOutline = true
@@ -103,8 +103,8 @@ class WidgetContainer(private val L: MainActivity, val item: WidgetItem) : Frame
             val br = (L.profile?.dp(11f) ?: 28f)
             val cx = br * 1.2f; val cy = br * 1.2f
             c.drawCircle(cx, cy, br, badgePaint)
-            badgeLine.strokeWidth = br * 0.22f
-            c.drawLine(cx - br * 0.45f, cy, cx + br * 0.45f, cy, badgeLine)
+            badgeLine.strokeWidth = br * 0.2f
+            c.drawLine(cx - br * 0.42f, cy, cx + br * 0.42f, cy, badgeLine)
         }
     }
 
